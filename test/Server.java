@@ -3,19 +3,39 @@ import java.util.*;
 import java.io.*;
 import java.nio.channels.FileChannel;
 
+// the data structure of Server that is snapshoted to disk
+class ServerDS implements java.io.Serializable{
+	int commitN;
+	HashMap<Integer, Commit> commitMap;
+	public ServerDS(HashMap<Integer, Commit> commitMap, int commitN){
+		this.commitMap=commitMap;
+		this.commitN=commitN;
+	}
+}
+
 // a class that saves the info of a certain commit
-class Commit{
-	public int num;
-	public int success;
-	public int fail;
-	public int userN;
-	public HashMap<String, Character> users;
-	public Commit(int userN){
+class Commit implements java.io.Serializable{
+	public String filename;
+	public byte[] img;
+	public int num; // commit ID
+	public int success; // number of successful votes
+	public int fail; // number of failure votes
+	public int userN; // number of userNodes
+	public char decision; // 'N'-no decision yet, 'C'-commit, 'A'-abort
+	public HashMap<String, Character> userResponse; // users' voting--'S':success, 'F'--failure
+	public HashSet<String> users;
+	public HashSet<String> ack;
+	public Commit(String filename, byte[] img, int userN, HashSet users){
+		this.filename=filename;
+		this.img=img;
 		this.num=0;
 		this.success=0;
 		this.fail=0;
 		this.userN=userN;
-		users=new HashMap<String, Character>();
+		this.decision='N';
+		this.users=users;
+		this.ack=new HashSet<String>();
+		userResponse=new HashMap<String, Character>();
 	}
 }
 
@@ -31,53 +51,81 @@ class Msg implements java.io.Serializable{
 	}
 }
 
-// a thead to send msg to a certain usernode 
-class SendMsg extends Thread
+// a thead to send prepare msg to a certain usernode 
+class SendPrepare extends Thread
 {
-	int T = 0; // at most resend msg T times
 	ProjectLib.Message msg;
 	ProjectLib PL;
 	Commit commit;
 	String user;
-	SendMsg (ProjectLib PL, ProjectLib.Message msg, Commit commit, String user)
+
+	SendPrepare (ProjectLib PL, ProjectLib.Message msg, Commit commit, String user)
 	{
 		this.PL = PL;
 		this.msg = msg;
 		this.commit = commit;
 		this.user = user;
 	}
+
 	public void run ()
 	{
-	  System.out.println ("Send msg to "+msg.addr);
-	  PL.sendMessage(msg);
-	  // while(T<5){ 
-	  	try{
-		  	Thread.sleep(1300);
-	  	}catch(Exception e){
-	  		e.printStackTrace();
-	  	}
-	  	if(commit.users.containsKey(user)) {
-	  		System.out.println("Finish sending msg to "+msg.addr);
-	  		System.exit(0);
-	  	}
-	  	// System.out.println ("Send msg to "+msg.addr+" for the "+(T+2)+" time");
-	  	// PL.sendMessage(msg);
-	  	// T++;
-	  // }
-	  commit.fail++;
-	  commit.users.put(user, 'F');
-	  System.out.println("Set fail by default! Fail: "+commit.fail+", Success: "+commit.success);
+		PL.sendMessage(msg);
+		try{
+			Thread.sleep(3000);
+		}catch(Exception e){
+			e.printStackTrace();
+		}
+		if(!commit.userResponse.containsKey(user)) {
+			// timeout
+			commit.fail++;
+			commit.userResponse.put(user, 'F');
+		}
+	}
+}
+
+// a thead to send decision msg to a certain usernode 
+class SendDecision extends Thread
+{
+	ProjectLib PL;
+	ProjectLib.Message msg;
+	HashMap<Integer, Commit> commitMap;
+	int num;
+	String user;
+
+	SendDecision (ProjectLib PL, ProjectLib.Message msg, HashMap<Integer, Commit> commitMap, int num, String user)
+	{
+		this.PL = PL;
+		this.msg = msg;
+		this.commitMap = commitMap;
+		this.num=num;
+		this.user = user;
+	}
+
+	public void run ()
+	{
+		while(true){
+			// send decision msg until receive users' ACK
+			PL.sendMessage(msg);
+			try{
+				Thread.sleep(3000);
+			}catch(Exception e){
+				e.printStackTrace();
+			}
+			if(!commitMap.containsKey(num)){
+				break;
+			}
+			if(commitMap.get(num).ack.contains(user)) {
+				break;
+			}
+		}
 	}
 }
 
 public class Server implements ProjectLib.CommitServing {
-	static HashMap<Integer, Commit> commitMap;
-	static HashSet<String> deleted;
-
-	private static HashSet<String> userReplies;
+	private static HashMap<Integer, Commit> commitMap;
 	private static int commitN = 0;
-	private static long T0;
 	private static ProjectLib PL;
+	private static ServerDS serverDS;
 
 	// serialize message
 	public static byte[] serialize(Object msg) throws IOException {
@@ -99,16 +147,9 @@ public class Server implements ProjectLib.CommitServing {
 	// callback function that processes each commit
 	public void startCommit( String filename, byte[] img, String[] sources ) {
 		HashMap<String, ArrayList<String>> hm = new HashMap<String, ArrayList<String>>();
-		System.out.println( "Server: Got request to commit "+filename );
+		HashSet<String> users = new HashSet<String>();
 		int len = sources.length;
-		System.out.println("source files: ");
-		for(int i=0; i<len; i++) System.out.println(sources[i]);
-
 		for(int i=0; i<len; i++) {
-			// if the file has been deleted before
-			if(deleted.contains(sources[i])){ 
-				return;
-			} 
 			String[] str = sources[i].split(":");
 			if(hm.containsKey(str[0])){
 				ArrayList<String> list = hm.get(str[0]);
@@ -117,11 +158,13 @@ public class Server implements ProjectLib.CommitServing {
 				ArrayList<String> list = new ArrayList<String>();
 				list.add(str[1]);
 				hm.put(str[0], list);
+				users.add(str[0]);
 			}
 		}
 
-		Commit commit = new Commit(hm.size());
+		Commit commit = new Commit(filename, img, hm.size(), users);
 		addCommit(commit);
+		saveSnapshot();
 
 		// send msg to usernodes
 		for(Map.Entry<String, ArrayList<String>> entry : hm.entrySet()){
@@ -134,108 +177,172 @@ public class Server implements ProjectLib.CommitServing {
 			try{
 				msg = new ProjectLib.Message(key, serialize((Object) userMsg));
 			}catch(Exception e){
-				System.out.println("Error changing type!");
 			}
-			SendMsg sendThread = new SendMsg(PL, msg, commit, key);
+			SendPrepare sendThread = new SendPrepare(PL, msg, commit, key);
 			sendThread.start();
 		}
-		
-		// wait until all the node send back voting results
-		// while(commit.fail>0 || commit.fail+commit.success<commit.userN){
-		// 	System.out.println("In Loop! Fail: "+commit.fail+", Success: "+commit.success+", userN: "+commit.userN);
-		// 	if(commit.fail>0){
-		// 		System.out.println("Abort commit "+commit.num);
-		// 		// send abort msg to usernodes
-		// 		for(String key : hm.keySet()){
-		// 			String c = "abort"+Integer.toString(commit.num);
-		// 			ProjectLib.Message commit_msg = new ProjectLib.Message(key, c.getBytes() );
-		// 			PL.sendMessage(commit_msg);
-		// 		}
-		// 		commitMap.remove(commit.num);
-		// 		return;
-		// 	}
-		// 	try{
-		// 		Thread.sleep(300);
-		// 	} catch(Exception e){
-		// 		e.printStackTrace();
-		// 	}
-		// }
 
-		while(commit.fail+commit.success!=commit.userN){
-			System.out.println("In Loop! Fail: "+commit.fail+", Success: "+commit.success+", userN: "+commit.userN);
+		int n = 0;
+		while(n<6 && (commit.fail+commit.success!=commit.userN)){
 			try{
-				Thread.sleep(300);
+				Thread.sleep(500);
+				n++;
 			} catch(Exception e){
 				e.printStackTrace();
 			}
 		}
 
-		System.out.println("Out of Loop! Fail: "+commit.fail+", Success: "+commit.success+", userN: "+commit.userN);
-
-		if(commit.fail>0){
-			System.out.println("Abort commit "+commit.num);
-			// send abort msg to usernodes
-			for(String key : hm.keySet()){
-				String c = "abort"+Integer.toString(commit.num);
-				ProjectLib.Message commit_msg = new ProjectLib.Message(key, c.getBytes() );
-				PL.sendMessage(commit_msg);
-			}
-			commitMap.remove(commit.num);
-			return;
+		// timeout, abort
+		if(commit.fail>0 || commit.fail+commit.success!=commit.userN){
+			if(commit.decision=='N') server_abort(commit);
 		}
+	}
 
-		System.out.println("Get all results for "+commit.num+"! success: "+commit.success+", fail: "+commit.fail+", userN: "+commit.userN);
-
-		System.out.println("Commit "+commit.num+"!");
-		for(String key : hm.keySet()){
-			String c = "commit"+Integer.toString(commit.num);
+	// commit
+	private static void server_abort(Commit commit){
+		commit.decision='A';
+		saveSnapshot();
+		// send abort msg to usernodes
+		for(String key : commit.users){
+			String c = "abort"+Integer.toString(commit.num);
 			ProjectLib.Message commit_msg = new ProjectLib.Message(key, c.getBytes() );
-			PL.sendMessage(commit_msg);
+			SendDecision sendDecision = new SendDecision(PL, commit_msg, commitMap, commit.num, key);
+			sendDecision.start();
 		}
-		for(int i=0; i<len; i++) deleted.add(sources[i]);
+	}
 
-		//really commit
+	// abort
+	private static void server_commit(Commit commit){
+		commit.decision='C';
+		saveSnapshot();
 		try{
-			FileOutputStream fos = new FileOutputStream(filename);
-			fos.write(img);
+			FileOutputStream fos = new FileOutputStream(commit.filename);
+			fos.write(commit.img);
 			fos.close();
 		}catch(Exception e){
 			e.printStackTrace();
-			System.out.println("Failed to copy!");
 		}
-		commitMap.remove(commit.num);
+		PL.fsync();
 
-		commitMap.remove(commit.num);
-		System.out.println("Commit END!!!");
+		for(String key : commit.users){
+			String c = "commit"+Integer.toString(commit.num);
+			ProjectLib.Message commit_msg = new ProjectLib.Message(key, c.getBytes() );
+			SendDecision sendDecision = new SendDecision(PL, commit_msg, commitMap, commit.num, key);
+			sendDecision.start();
+		}
+	}
+
+	// Snapshot to disk
+	private synchronized static void saveSnapshot(){
+		serverDS = new ServerDS(commitMap, commitN);
+		try {
+			FileOutputStream fos = new FileOutputStream("snapshot");
+			ObjectOutputStream oos = new ObjectOutputStream(fos);
+			oos.writeObject(serverDS);
+			oos.close();
+			PL.fsync();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+
+	// read snapshot from disk
+	private static void readSnapshot(){
+		try {
+			FileInputStream fis = new FileInputStream("snapshot");
+			ObjectInputStream ois = new ObjectInputStream(fis);
+			Object snapshot_object = ois.readObject();
+			if(snapshot_object!=null){
+				serverDS = (ServerDS) snapshot_object;
+				commitMap = serverDS.commitMap;
+				commitN = serverDS.commitN;
+				cleanUp();
+			}
+		} catch (FileNotFoundException e){
+			// no snapshot
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+	}
+
+	// process unfinished requests before Server fails
+	private static void cleanUp(){
+		for(Map.Entry<Integer, Commit> entry : commitMap.entrySet()){
+			int num=entry.getKey();
+			Commit commit=entry.getValue();
+			if(commit.decision=='N'){
+				// abort
+				for(String user:commit.users){
+					String c = "abort"+Integer.toString(commit.num);
+					ProjectLib.Message abort_msg = new ProjectLib.Message(user, c.getBytes() );
+					SendDecision sendDecision = new SendDecision(PL, abort_msg, commitMap, commit.num, user);
+					sendDecision.start();
+				}
+			}else if(commit.decision=='A'){
+				// send abort msg to users that have not sent back ACK yet
+				for(String user:commit.users){
+					if(!commit.ack.contains(user)){
+						String c = "abort"+Integer.toString(commit.num);
+						ProjectLib.Message abort_msg = new ProjectLib.Message(user, c.getBytes() );
+						SendDecision sendDecision = new SendDecision(PL, abort_msg, commitMap, commit.num, user);
+						sendDecision.start();
+					}
+				}
+			}else{
+				// send commit msg to users that have not sent back ACK yet
+				File file = new File(commit.filename);
+				if(!file.exists()){
+					// hasn't composed the image yet
+					try{
+						FileOutputStream fos = new FileOutputStream(commit.filename);
+						fos.write(commit.img);
+						fos.close();
+					}catch(Exception e){
+						e.printStackTrace();
+					}
+					PL.fsync();
+				}
+				for(String user:commit.users){
+					if(!commit.ack.contains(user)){
+						String c = "commit"+Integer.toString(commit.num);
+						ProjectLib.Message commit_msg = new ProjectLib.Message(user, c.getBytes() );
+						SendDecision sendDecision = new SendDecision(PL, commit_msg, commitMap, commit.num, user);
+						sendDecision.start();
+					}
+				}
+			}
+		}
 	}
 	
 	public static void main ( String args[] ) throws Exception {
 		if (args.length != 1) throw new Exception("Need 1 arg: <port>");
 		Server srv = new Server();
-		commitMap = new HashMap<Integer, Commit>();
-		deleted = new HashSet<String>();
-		userReplies = new HashSet<String>();
-		T0 = System.currentTimeMillis();
 		PL = new ProjectLib( Integer.parseInt(args[0]), srv );
-		
+		readSnapshot();
+		if(commitMap==null) commitMap = new HashMap<Integer, Commit>();
 		// main loop
 		while (true) {
 			ProjectLib.Message msg = PL.getMessage();
 			String str = new String(msg.body, "UTF-8");
-			System.out.println( "Server: Got message from "+msg.addr+"--content: "+str);
-			if(!userReplies.add(str)) continue; // if server has received this msg before
 			String[] tmp = str.split("#");
 			int num = Integer.parseInt(tmp[0]);
 			String user = tmp[1];
 			String ret = tmp[2];
 			if(commitMap.containsKey(num)){
 				Commit commit = commitMap.get(num);
-				if(ret.equals("S")){ // return success
-					commit.users.put(user, 'S');
+				if(ret.equals("S")){ // usernode returns success
+					commit.userResponse.put(user, 'S');
 					commit.success++;
-				}else{	// return fail
-					commit.users.put(user, 'F');
+					if(commit.success==commit.userN) server_commit(commit);
+				}else if(ret.equals("F")){	// usernode returns fail
+					commit.userResponse.put(user, 'F');
 					commit.fail++;
+					if(commit.decision!='A')server_abort(commit);
+				}else{ // usernode returns ACK
+					commit.ack.add(user);
+					if(commit.ack.size()==commit.userN){ // receive ACK from all usernodes
+						commitMap.remove(num);
+					}
 				}
 			}
 		}

@@ -5,10 +5,6 @@ public class UserNode{
 	public UserNode( String id ) {
 		myId = id;
 	}
-
-	// public void handlemsg(ProjectLib.Message msg){
-	// 	boolean ret = ProjectLib.askUser(msg.body, msg.)
-	// }
 	
 	public static void main ( String args[] ) throws Exception {
 		if (args.length != 2) throw new Exception("Need 2 args: <port> <id>");
@@ -20,13 +16,8 @@ public class UserNode{
 			System.out.println(args[1]+": Got message from " + msg.addr);
 			System.out.println("content: "+ str);
 			String[] s = str.split("#");
-			
-			// System.out.println( "Server: Echoing message to " + msg.addr );
-			// PL.sendMessage( msg );
 		}
-		// ProjectLib.Message msg = new ProjectLib.Message( "Server", "hello".getBytes() );
-		// System.out.println( args[1] + ": Sending message to " + msg.addr );
-		// PL.sendMessage( msg );
+		Message( msg );
 	}
 }
 
